@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import functools
 import json
 import math
 import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -66,7 +68,7 @@ START_CRF_NEIGHBOURS = 5        # a célhoz legközelebbi ennyi korábbi mérés
 SITI_ANALYSIS_WIDTH = 960       # a szélesebb videókat erre kicsinyítjük (gyorsít); a keskenyebbeket nem nagyítjuk
 SITI_VERSION = 2                # emelni kell, ha a SI/TI mérés módja változik (a régi értékek nem összevethetők)
 SITI_MIN_SEGMENT_SECONDS = 60   # ennél rövidebb szakaszokra nem bontunk (párhuzamos mérés)
-SITI_MAX_PARALLEL = 8
+SITI_MAX_PARALLEL = 16           # a párhuzamos SI/TI folyamatok felső határa (a felületen is)
 SITI_OUTPUT_TAIL_LINES = 60     # az összegzés a kimenet végén van
 SIMILAR_COMPLEXITY_MAX = 0.35   # log-távolság (SI és TI), amelyen belül két videó "hasonló"
 SIMILAR_VIDEOS_MIN = 2          # ennyi hasonló videó kell, különben a régi becslés marad
@@ -108,6 +110,7 @@ DEFAULT_CONFIG = {
     "preset": "6",
     "low_priority": True,
     "ten_bit": True,
+    "siti_parallel": "auto",
     "sort_crit": "Fájlnév",
     "sort_order": SORT_ASCENDING,
 }
@@ -218,6 +221,96 @@ def resolution_class(resolution: str) -> str | None:
     if pixels <= 0:
         return None
     return next((name for limit, name in RESOLUTION_CLASSES if pixels < limit), "4K")
+
+
+def allowed_cpu_count() -> int:
+    """A folyamat által használható logikai processzorszálak száma (az affinitást figyelembe véve)."""
+    if hasattr(os, "process_cpu_count"):                # Python 3.13+
+        return os.process_cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0)) or 1
+    return os.cpu_count() or 1
+
+
+def _physical_cores_psutil() -> int | None:
+    try:
+        import psutil
+    except ImportError:
+        return None
+    return psutil.cpu_count(logical=False)
+
+
+def _physical_cores_linux() -> int | None:
+    """Az engedélyezett logikai szálak különböző (tokozás, mag) párjai a /sys topológiából."""
+    if not sys.platform.startswith("linux"):
+        return None
+    cores = set()
+    for cpu in os.sched_getaffinity(0):
+        topology = f"/sys/devices/system/cpu/cpu{cpu}/topology/"
+        with open(topology + "physical_package_id") as f1, open(topology + "core_id") as f2:
+            cores.add((f1.read().strip(), f2.read().strip()))
+    return len(cores) or None
+
+
+def _physical_cores_windows() -> int | None:
+    """A kernel32 GetLogicalProcessorInformation "processzormag" bejegyzéseinek száma."""
+    if not IS_WINDOWS:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessorInfo(ctypes.Structure):      # SYSTEM_LOGICAL_PROCESSOR_INFORMATION
+        _fields_ = [
+            ("processor_mask", ctypes.c_size_t),
+            ("relationship", ctypes.c_int),
+            ("reserved", ctypes.c_ulonglong * 2),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    length = wintypes.DWORD(0)
+    kernel32.GetLogicalProcessorInformation(None, ctypes.byref(length))    # a szükséges méret lekérdezése
+    count = length.value // ctypes.sizeof(ProcessorInfo)
+    if count == 0:
+        return None
+    buffer = (ProcessorInfo * count)()
+    if not kernel32.GetLogicalProcessorInformation(buffer, ctypes.byref(length)):
+        return None
+    relation_processor_core = 0
+    return sum(1 for info in buffer if info.relationship == relation_processor_core) or None
+
+
+def _physical_cores_macos() -> int | None:
+    if sys.platform != "darwin":
+        return None
+    output = subprocess.run(["sysctl", "-n", "hw.physicalcpu"], capture_output=True, text=True).stdout
+    return int(output.strip())
+
+
+@functools.lru_cache(maxsize=1)
+def physical_core_count() -> int:
+    """
+    A fizikai processzormagok száma (hyperthreading/SMT szálak nélkül), a
+    folyamat számára engedélyezett szálakra korlátozva. Ha nem deríthető ki,
+    a logikai szálak száma.
+    """
+    allowed = allowed_cpu_count()
+    for detect in (_physical_cores_psutil, _physical_cores_linux, _physical_cores_windows, _physical_cores_macos):
+        try:
+            cores = detect()
+        except Exception:   # platformfüggő lekérdezés: bármilyen hibánál a következő módszer jön
+            cores = None
+        if cores:
+            return max(1, min(cores, allowed))
+    return allowed
+
+
+def siti_auto_parallel() -> int:
+    """
+    Automatikus SI/TI párhuzamosság: fizikai magok száma - 1 (egy mag szabadon
+    marad). A siti szűrő tisztán számol, egy mag második (SMT) szála alig gyorsít,
+    ezért a fizikai magokhoz igazodunk, nem a logikai szálakhoz.
+    """
+    return clamp(physical_core_count() - 1, 1, SITI_MAX_PARALLEL)
 
 
 def find_video_files(directory: str) -> list[str]:
@@ -334,6 +427,7 @@ class EncodeSettings:
     preset: str
     low_priority: bool
     ten_bit: bool = True
+    siti_parallel: int = 0      # párhuzamos SI/TI folyamatok; 0 = automatikus
 
     def threshold(self, metric: str) -> float | None:
         return {"mean": self.target_vmaf, "low_1": self.target_vmaf_1, "low_5": self.target_vmaf_5}[metric]
@@ -1286,7 +1380,7 @@ class Transcoder:
             self._log(f"  > Komplexitás (korábbi mérésből): SI {cached.si:.1f}, TI {cached.ti:.1f}")
             return cached
 
-        cmds, durations = self._siti_commands(job.input_file, job.duration)
+        cmds, durations = self._siti_commands(job.input_file, job.duration, job.settings.siti_parallel)
         parallel = f", {len(cmds)} párhuzamos szakaszban" if len(cmds) > 1 else ""
         self._log(f"  [Info] Komplexitás mérése (SI/TI) a teljes videón{parallel}...")
         results = self._run_ffmpeg_many(cmds, durations, job.settings.low_priority, SITI_OUTPUT_TAIL_LINES)
@@ -1301,14 +1395,15 @@ class Transcoder:
         return complexity
 
     @staticmethod
-    def _siti_commands(input_file: str, duration: float) -> tuple[list[list[str]], list[float]]:
+    def _siti_commands(input_file: str, duration: float, parallel: int = 0) -> tuple[list[list[str]], list[float]]:
         """
         A siti szűrő egyszálú és lassú, ezért hosszabb videót időben egyenlő
         szakaszokra bontunk, és párhuzamosan mérünk; az eredményt a képkockaszámmal
         súlyozva összesítjük. Minden képkocka mérésre kerül (a szakaszhatárokon
-        a TI egy-egy képkockánál 0, ez elhanyagolható).
+        a TI egy-egy képkockánál 0, ez elhanyagolható). parallel: a folyamatok
+        legnagyobb száma, 0 = automatikus (fizikai magok alapján).
         """
-        workers = max(1, min(SITI_MAX_PARALLEL, (os.cpu_count() or 2) - 1))
+        workers = parallel if parallel > 0 else siti_auto_parallel()
         segments = max(1, min(workers, int(duration // SITI_MIN_SEGMENT_SECONDS))) if duration > 0 else 1
         length = duration / segments if duration > 0 else 0.0
         # A szélesebb videót kicsinyítjük (gyorsabb), a keskenyebbet natív felbontáson
@@ -1549,6 +1644,16 @@ class AV1VmafApp:
             frame, text="10 bites kódolás (kisebb fájl azonos minőségnél)", variable=self.ten_bit_var
         ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=5)
 
+        ttk.Label(frame, text="SI/TI párhuzamos folyamatok:").grid(row=3, column=2, sticky=tk.W, pady=5, padx=(15, 0))
+        self.siti_auto_label = f"Automatikus ({siti_auto_parallel()})"
+        self.siti_parallel_combo = ttk.Combobox(
+            frame,
+            values=[self.siti_auto_label] + [str(i) for i in range(1, SITI_MAX_PARALLEL + 1)],
+            width=16,
+            state="readonly",
+        )
+        self.siti_parallel_combo.grid(row=3, column=3, sticky=tk.W, pady=5, padx=5)
+
     @staticmethod
     def _labeled_entry(parent: ttk.Frame, text: str, row: int, column: int) -> ttk.Entry:
         ttk.Label(parent, text=text).grid(
@@ -1665,6 +1770,9 @@ class AV1VmafApp:
         self.preset_combo.set(config["preset"])
         self.low_priority_var.set(config["low_priority"])
         self.ten_bit_var.set(config["ten_bit"])
+        parallel = str(config["siti_parallel"])
+        valid = parallel.isdigit() and 1 <= int(parallel) <= SITI_MAX_PARALLEL
+        self.siti_parallel_combo.set(parallel if valid else self.siti_auto_label)
         self.sort_crit_combo.set(config["sort_crit"])
         self.sort_order_combo.set(config["sort_order"])
 
@@ -1674,6 +1782,7 @@ class AV1VmafApp:
             preset=self.preset_combo.get(),
             low_priority=self.low_priority_var.get(),
             ten_bit=self.ten_bit_var.get(),
+            siti_parallel=self._siti_parallel_setting() or "auto",
             sort_crit=self.sort_crit_combo.get(),
             sort_order=self.sort_order_combo.get(),
         )
@@ -1689,7 +1798,13 @@ class AV1VmafApp:
             preset=self.preset_combo.get(),
             low_priority=self.low_priority_var.get(),
             ten_bit=self.ten_bit_var.get(),
+            siti_parallel=self._siti_parallel_setting(),
         )
+
+    def _siti_parallel_setting(self) -> int:
+        """A választott SI/TI párhuzamosság; 0 = automatikus."""
+        value = self.siti_parallel_combo.get()
+        return int(value) if value.isdigit() else 0
 
     # --- Napló és folyamatjelző -------------------------------------------------
 
