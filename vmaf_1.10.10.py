@@ -63,15 +63,19 @@ START_CRF_MIN, START_CRF_MAX = 15, 45
 START_CRF_NEIGHBOURS = 5        # a célhoz legközelebbi ennyi korábbi mérés CRF-átlaga
 
 # Komplexitás (SI/TI, ITU-T P.910) – a teljes videó minden képkockáján mérve
-SITI_ANALYSIS_WIDTH = 960       # közös elemzési szélesség: gyorsít, és összevethetővé teszi a felbontásokat
+SITI_ANALYSIS_WIDTH = 960       # a szélesebb videókat erre kicsinyítjük (gyorsít); a keskenyebbeket nem nagyítjuk
+SITI_VERSION = 2                # emelni kell, ha a SI/TI mérés módja változik (a régi értékek nem összevethetők)
 SITI_MIN_SEGMENT_SECONDS = 60   # ennél rövidebb szakaszokra nem bontunk (párhuzamos mérés)
 SITI_MAX_PARALLEL = 8
 SITI_OUTPUT_TAIL_LINES = 60     # az összegzés a kimenet végén van
 SIMILAR_COMPLEXITY_MAX = 0.35   # log-távolság (SI és TI), amelyen belül két videó "hasonló"
 SIMILAR_VIDEOS_MIN = 2          # ennyi hasonló videó kell, különben a régi becslés marad
 SIMILAR_VIDEOS_MAX = 3
+# Felbontásosztályok pixelszám szerint (felső határ, név). A pixelszám a széles
+# vásznú (1920x800) és az álló (1080x1920) videókat is a helyes osztályba sorolja.
+RESOLUTION_CLASSES = ((600_000, "SD"), (1_200_000, "720p"), (2_800_000, "1080p"), (5_500_000, "1440p"))
 
-RESULT_CACHE_VERSION = 1        # emelni kell, ha a mérés módja változik (a régi cache érvénytelen)
+RESULT_CACHE_VERSION = 2        # emelni kell, ha a mérés módja változik (a régi cache érvénytelen)
 RESULT_CACHE_LIMIT = 300        # ennyi fájl adatát őrizzük meg (a legrégebben használtak törlődnek)
 
 MIN_CRF, MAX_CRF = 1, 46
@@ -205,6 +209,15 @@ def audio_copy_reason(track: Track) -> str | None:
     if 0 < track.bitrate <= target:
         return f"forrás {track.bitrate / 1000:.0f}k ≤ {target // 1000}k"
     return None
+
+
+def resolution_class(resolution: str) -> str | None:
+    """A "SZÉLESSÉGxMAGASSÁG" felbontás osztálya (SD, 720p, 1080p, 1440p, 4K); None, ha ismeretlen."""
+    width, _, height = str(resolution).partition("x")
+    pixels = to_float(width) * to_float(height)
+    if pixels <= 0:
+        return None
+    return next((name for limit, name in RESOLUTION_CLASSES if pixels < limit), "4K")
 
 
 def find_video_files(directory: str) -> list[str]:
@@ -446,7 +459,7 @@ class EncodeHistory:
     ) -> None:
         record = {"vmaf": vmaf, "crf": crf, "preset": preset, "resolution": resolution}
         if complexity is not None:
-            record.update(si=complexity.si, ti=complexity.ti)
+            record.update(si=complexity.si, ti=complexity.ti, siti_version=SITI_VERSION)
         self._records.append(record)
         self._records = self._records[-self._limit:]
         save_json(self._path, self._records)
@@ -458,9 +471,9 @@ class EncodeHistory:
         A célhoz legközelebbi korábbi mérések CRF-átlaga. Ha van ilyen, az azonos
         presetű, azon belül az azonos felbontású méréseket részesíti előnyben.
 
-        Ha ismert a videó komplexitása, és van legalább SIMILAR_VIDEOS_MIN hasonló
-        komplexitású korábbi videó, csak azok méréseiből becsül. Visszatérés:
-        (kezdő CRF, a felhasznált hasonló videók száma; 0 = régi módszer).
+        Ha ismert a videó komplexitása, és van legalább SIMILAR_VIDEOS_MIN azonos
+        felbontásosztályú, hasonló komplexitású korábbi videó, csak azok méréseiből
+        becsül. Visszatérés: (kezdő CRF, a felhasznált hasonló videók száma; 0 = régi módszer).
         """
         if not self._records:
             return DEFAULT_START_CRF, 0
@@ -468,7 +481,7 @@ class EncodeHistory:
         candidates = [r for r in self._records if r.get("preset") == preset] or self._records
         similar_count = 0
         if complexity is not None:
-            similar = self._similar_records(candidates, complexity)
+            similar = self._similar_records(candidates, complexity, resolution)
             if similar:
                 candidates, similar_count = similar
         candidates = [r for r in candidates if r.get("resolution") == resolution] or candidates
@@ -479,11 +492,23 @@ class EncodeHistory:
         return clamp(round(avg_crf), START_CRF_MIN, START_CRF_MAX), similar_count
 
     @staticmethod
-    def _similar_records(records: list[dict], complexity: Complexity) -> tuple[list[dict], int] | None:
-        """A komplexitásban legközelebbi (legfeljebb SIMILAR_VIDEOS_MAX) videó mérései."""
+    def _similar_records(
+        records: list[dict], complexity: Complexity, resolution: str
+    ) -> tuple[list[dict], int] | None:
+        """
+        Az azonos felbontásosztályú, komplexitásban legközelebbi (legfeljebb
+        SIMILAR_VIDEOS_MAX) videó mérései. A felbontás magától is erősen
+        befolyásolja a CRF–VMAF viszonyt, és az SI is felbontásfüggő, ezért csak
+        osztályon belül hasonlítunk.
+        """
+        target_class = resolution_class(resolution)
+        if target_class is None:
+            return None
         # Egy videó összes mérése ugyanazt az SI/TI párt hordozza: így csoportosítunk videónként.
         by_video: dict[Complexity, list[dict]] = {}
         for r in records:
+            if r.get("siti_version") != SITI_VERSION or resolution_class(r.get("resolution", "")) != target_class:
+                continue
             si, ti = r.get("si"), r.get("ti")
             if isinstance(si, (int, float)) and isinstance(ti, (int, float)):
                 by_video.setdefault(Complexity(si, ti), []).append(r)
@@ -1286,7 +1311,9 @@ class Transcoder:
         workers = max(1, min(SITI_MAX_PARALLEL, (os.cpu_count() or 2) - 1))
         segments = max(1, min(workers, int(duration // SITI_MIN_SEGMENT_SECONDS))) if duration > 0 else 1
         length = duration / segments if duration > 0 else 0.0
-        video_filter = f"scale={SITI_ANALYSIS_WIDTH}:-2,format=yuv420p,siti=print_summary=1"
+        # A szélesebb videót kicsinyítjük (gyorsabb), a keskenyebbet natív felbontáson
+        # mérjük: a felnagyítás nem ad részletet, csak elmossa az éleket és lassít.
+        video_filter = f"scale=w='min({SITI_ANALYSIS_WIDTH},iw)':h=-2,format=yuv420p,siti=print_summary=1"
 
         cmds, durations = [], []
         for i in range(segments):
