@@ -27,6 +27,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import json
+import math
 import os
 import queue
 import re
@@ -35,7 +36,7 @@ import threading
 import time
 import tkinter as tk
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from tkinter import filedialog, messagebox, ttk
 from typing import NamedTuple
 
@@ -70,7 +71,12 @@ MAX_LOW_JUMP = 5
 MAX_MEAN_JUMP = 6
 FIRST_MEAN_STEP = 4             # első elbukott mérés után (még nincs meredekség)
 FALLBACK_MEAN_STEP = 2          # ha a meredekség nem használható
+MAX_UP_JUMP = 5                 # felfelé keresésnél legfeljebb ennyit lépünk, amíg nincs felső határ
 GAP_EPSILON = 1e-9
+
+# Az MKV-be nem másolható feliratformátumok -> amire átalakítjuk őket
+SUBTITLE_CONVERSIONS = {"mov_text": "srt"}
+HDR_TRANSFERS = ("smpte2084", "arib-std-b67")   # PQ és HLG
 
 UI_POLL_MS = 100
 OUTPUT_TAIL_LINES = 15          # hiba esetén ennyi utolsó ffmpeg-sort naplózunk
@@ -84,6 +90,7 @@ DEFAULT_CONFIG = {
     "tolerance": "1.0",
     "preset": "6",
     "low_priority": True,
+    "ten_bit": True,
     "sort_crit": "Fájlnév",
     "sort_order": SORT_ASCENDING,
 }
@@ -159,8 +166,27 @@ def is_hungarian(description: str) -> bool:
     return any(marker in text for marker in HUNGARIAN_MARKERS)
 
 
+def audio_bitrate_bps(channels: int) -> int:
+    """A cél OPUS bitráta bit/s-ban."""
+    return 96_000 if channels <= 2 else 192_000
+
+
 def audio_bitrate_for(channels: int) -> str:
-    return "96k" if channels <= 2 else "192k"
+    return f"{audio_bitrate_bps(channels) // 1000}k"
+
+
+def audio_copy_reason(track: Track) -> str | None:
+    """
+    Ha a hangsávot érdemesebb változatlanul átmásolni, a másolás oka; None, ha
+    OPUS-ra kódoljuk. Az újrakódolás csak veszít, ha a forrás már OPUS, vagy ha
+    a bitrátája eleve nem nagyobb a cél OPUS bitrátánál (a fájl nem lenne kisebb).
+    """
+    if track.codec == "opus":
+        return "már OPUS"
+    target = audio_bitrate_bps(track.channels)
+    if 0 < track.bitrate <= target:
+        return f"forrás {track.bitrate / 1000:.0f}k ≤ {target // 1000}k"
+    return None
 
 
 def find_video_files(directory: str) -> list[str]:
@@ -195,6 +221,8 @@ class Track:
     index: int              # ffprobe stream index (-map 0:<index>)
     description: str
     channels: int = 0       # csak hangsávnál értelmezett
+    codec: str = ""         # ffprobe codec_name, kisbetűvel
+    bitrate: float = 0.0    # bit/s, 0 ha ismeretlen
 
 
 @dataclass
@@ -204,8 +232,17 @@ class MediaInfo:
     resolution: str = "0x0"
     duration: float = 0.0
     bitrate: float = 0.0
+    bit_depth: int = 8
+    # Színinformációk ffprobe-nevekkel ("" ha ismeretlen); HDR-nél fontos megőrizni.
+    color_primaries: str = ""
+    color_transfer: str = ""
+    color_space: str = ""
     audio_streams: tuple[Track, ...] = ()
     sub_streams: tuple[Track, ...] = ()
+
+    @property
+    def is_hdr(self) -> bool:
+        return self.color_transfer in HDR_TRANSFERS
 
 
 @dataclass
@@ -264,6 +301,7 @@ class EncodeSettings:
     tolerance: float            # a felületen megadható, de a CRF-keresés jelenleg nem használja
     preset: str
     low_priority: bool
+    ten_bit: bool = True
 
     def threshold(self, metric: str) -> float | None:
         return {"mean": self.target_vmaf, "low_1": self.target_vmaf_1, "low_5": self.target_vmaf_5}[metric]
@@ -299,8 +337,9 @@ class EncodeJob:
     input_file: str
     settings: EncodeSettings
     duration: float
-    map_args: list[str]
-    audio_args: list[str]
+    map_args: list[str]         # -map paraméterek
+    video_args: list[str]       # pixelformátum, színinformációk
+    codec_args: list[str]       # hang- és feliratsávonkénti kodekbeállítások
     resolution: str
 
     @property
@@ -424,17 +463,46 @@ def _stream_labels(stream: dict) -> tuple[str, str, str]:
     return codec, tags.get("language", "und").upper(), tags.get("title", "")
 
 
+def _stream_bitrate(stream: dict) -> float:
+    """A sáv bitrátája; az MKV-k gyakran csak a (mkvmerge által írt) BPS címkében tárolják."""
+    tags = stream.get("tags", {})
+    for value in (stream.get("bit_rate"), tags.get("BPS"), tags.get("BPS-eng")):
+        bitrate = to_float(value)
+        if bitrate > 0:
+            return bitrate
+    return 0.0
+
+
 def _audio_track(stream: dict) -> Track:
     codec, lang, title = _stream_labels(stream)
     channels = stream.get("channels") or 2
+    track = Track(stream.get("index"), "", channels, codec.lower(), _stream_bitrate(stream))
+    reason = audio_copy_reason(track)
+    target = f"másolás, {reason}" if reason else f"OPUS {audio_bitrate_for(channels)}"
     layout = stream.get("channel_layout") or f"{channels}ch"
-    desc = f"{codec} - Nyelv: {lang} - {layout} (-> OPUS {audio_bitrate_for(channels)})"
-    return Track(stream.get("index"), _with_title(desc, title), channels)
+    desc = f"{codec} - Nyelv: {lang} - {layout} (-> {target})"
+    return replace(track, description=_with_title(desc, title))
 
 
 def _subtitle_track(stream: dict) -> Track:
     codec, lang, title = _stream_labels(stream)
-    return Track(stream.get("index"), _with_title(f"{codec} - Nyelv: {lang}", title))
+    desc = f"{codec} - Nyelv: {lang}"
+    converted = SUBTITLE_CONVERSIONS.get(codec.lower())
+    if converted:
+        desc += f" (-> {converted.upper()})"
+    return Track(stream.get("index"), _with_title(desc, title), codec=codec.lower())
+
+
+def _bit_depth(pix_fmt: str) -> int:
+    """A pixelformátum bitmélysége (pl. yuv420p10le -> 10); alapértelmezés 8."""
+    match = re.search(r"p(\d{2})(?:le|be)$", pix_fmt)
+    return int(match.group(1)) if match else 8
+
+
+def _known(value) -> str:
+    """ffprobe színinformáció; az ismeretlen / fenntartott értékből üres szöveg."""
+    value = str(value or "")
+    return "" if value in ("unknown", "reserved", "unspecified") else value
 
 
 def probe_media(path: str) -> MediaInfo | None:
@@ -466,6 +534,10 @@ def probe_media(path: str) -> MediaInfo | None:
     if video is not None:
         info.video_codec = str(video.get("codec_name", "")).lower()
         info.resolution = f"{video.get('width', 0)}x{video.get('height', 0)}"
+        info.bit_depth = _bit_depth(str(video.get("pix_fmt", "")))
+        info.color_primaries = _known(video.get("color_primaries"))
+        info.color_transfer = _known(video.get("color_transfer"))
+        info.color_space = _known(video.get("color_space"))
         video_bitrate = to_float(video.get("bit_rate"))
     info.bitrate = video_bitrate if video_bitrate > 0 else to_float(fmt.get("bit_rate"))
     return info
@@ -512,15 +584,14 @@ def parse_vmaf_log(path: str) -> VmafScores:
 # 6. CRF-becslés segédfüggvényei
 # =============================================================================
 
-def predict_metric(measurements: dict[int, VmafScores], crf: int, metric: str, target_crf: int) -> float | None:
+def reference_slope(measurements: dict[int, VmafScores], crf: int, metric: str) -> float | None:
     """
-    Egy VMAF-mutató becsült értéke target_crf-nél, kizárólag az aktuális fájlon
-    ténylegesen megmért CRF-ek alapján (lineáris becslés):
-    - Ha van már mért CRF a jelenlegi fölött (tipikusan egy elbukott), a kettő
-      között interpolálunk.
-    - Különben a legközelebbi alatta lévő mérésből extrapolálunk.
-    - Ha nincs második mérés, None: ilyenkor nincs mire alapozni a becslést,
-      így a próbakódolást nem tiltjuk le.
+    Egy VMAF-mutató meredeksége (VMAF-pont / CRF-lépés) crf körül, kizárólag
+    az aktuális fájlon ténylegesen megmért CRF-ek alapján:
+    - Ha van már mért CRF a jelenlegi fölött (tipikusan egy elbukott), a
+      legközelebbivel számolunk (interpoláció).
+    - Különben a legközelebbi alatta lévő méréssel (extrapoláció).
+    - Ha nincs második mérés, None: nincs mire alapozni a becslést.
     """
     value = getattr(measurements[crf], metric)
     known = {c: getattr(s, metric) for c, s in measurements.items() if getattr(s, metric) is not None}
@@ -532,9 +603,7 @@ def predict_metric(measurements: dict[int, VmafScores], crf: int, metric: str, t
         ref = max(below)
     else:
         return None
-
-    slope = (known[ref] - value) / (ref - crf)
-    return value + slope * (target_crf - crf)
+    return (known[ref] - value) / (ref - crf)
 
 
 def metric_slope(history: list[tuple[int, VmafScores]], metric: str) -> float:
@@ -612,8 +681,9 @@ class Transcoder:
         mert nem lett kisebb az eredetinél). Megszakításkor és hibánál False.
         """
         duration = entry.info.duration if entry.info.duration > 0 else probe_duration(entry.path)
-        map_args, audio_args = self._build_stream_args(entry)
-        job = EncodeJob(entry.path, settings, duration, map_args, audio_args, entry.info.resolution)
+        map_args, codec_args = self._build_stream_args(entry)
+        video_args = self._build_video_args(entry.info, settings)
+        job = EncodeJob(entry.path, settings, duration, map_args, video_args, codec_args, entry.info.resolution)
 
         safe_remove(job.best_path)      # egy korábbi, megszakított futás maradéka
         try:
@@ -636,24 +706,60 @@ class Transcoder:
             safe_remove(job.temp_path, job.best_path, VMAF_LOG_FILE)
 
     def _build_stream_args(self, entry: FileEntry) -> tuple[list[str], list[str]]:
-        """A -map és a hangkódolási paraméterek a kijelölt sávok alapján."""
+        """A -map és a sávonkénti kodekparaméterek a kijelölt sávok alapján."""
         map_args = ["-map", "0:v:0"]
-        audio_args = ["-c:a", "libopus"]
+        codec_args: list[str] = []
 
         selected_audio = [t for t in entry.info.audio_streams if entry.selected_audio.get(t.index)]
         for out_idx, track in enumerate(selected_audio):
-            bitrate = audio_bitrate_for(track.channels)
             map_args += ["-map", f"0:{track.index}"]
-            audio_args += [f"-b:a:{out_idx}", bitrate]
+            prefix = f"  > Hangsáv (ID: {track.index}, {track.channels} csatorna)"
+            reason = audio_copy_reason(track)
+            if reason:
+                codec_args += [f"-c:a:{out_idx}", "copy"]
+                self._log(f"{prefix} -> másolás ({reason})")
+                continue
+            bitrate = audio_bitrate_for(track.channels)
+            codec_args += [f"-c:a:{out_idx}", "libopus", f"-b:a:{out_idx}", bitrate]
             if track.channels > 2:
-                audio_args += [f"-mapping_family:a:{out_idx}", "255"]
-            self._log(f"  > Hangsáv (ID: {track.index}, {track.channels} csatorna) -> OPUS {bitrate}")
+                codec_args += [f"-mapping_family:a:{out_idx}", "255"]
+            self._log(f"{prefix} -> OPUS {bitrate}")
 
-        for track in entry.info.sub_streams:
-            if entry.selected_subs.get(track.index):
-                map_args += ["-map", f"0:{track.index}"]
+        selected_subs = [t for t in entry.info.sub_streams if entry.selected_subs.get(t.index)]
+        for out_idx, track in enumerate(selected_subs):
+            map_args += ["-map", f"0:{track.index}"]
+            converted = SUBTITLE_CONVERSIONS.get(track.codec)
+            codec_args += [f"-c:s:{out_idx}", converted or "copy"]
+            if converted:
+                self._log(
+                    f"  > Felirat (ID: {track.index}) {track.codec.upper()} -> {converted.upper()} "
+                    "(az MKV nem tudja tárolni az eredeti formátumot)"
+                )
 
-        return map_args, audio_args
+        # Mellékletek (pl. az ASS feliratok betűtípusai). A "?" miatt nem hiba,
+        # ha a forrásban nincs ilyen (MP4, AVI).
+        map_args += ["-map", "0:t?"]
+        return map_args, codec_args
+
+    def _build_video_args(self, info: MediaInfo, settings: EncodeSettings) -> list[str]:
+        """Pixelformátum (8/10 bit) és a forrás színinformációinak megőrzése."""
+        args = []
+        # Az SVT-AV1 8 vagy 10 biten kódol; 10 bites (vagy magasabb) forrást nem butítunk le.
+        if settings.ten_bit or info.bit_depth > 8:
+            args += ["-pix_fmt", "yuv420p10le"]
+        for option, value in (
+            ("-color_primaries", info.color_primaries),
+            ("-color_trc", info.color_transfer),
+            ("-colorspace", info.color_space),
+        ):
+            if value:
+                args += [option, value]
+        if info.is_hdr:
+            self._log(
+                "  [Info] HDR forrás (PQ/HLG): 10 bites kódolás, a színinformációk megmaradnak. "
+                "A VMAF SDR-tartalomra készült, HDR-nél csak tájékoztató jellegű."
+            )
+        return args
 
     # --- CRF-keresés -------------------------------------------------------
 
@@ -661,8 +767,8 @@ class Transcoder:
         """
         A cél: az átlagos VMAF legyen minél közelebb a célértékhez felülről,
         miközben az opcionális 1% és 5% minimumok is teljesülnek. Ezért az első
-        megfelelő eredménynél nem állunk meg, hanem a CRF-et addig emeljük,
-        amíg valamelyik küszöb el nem bukik (vagy a becslés szerint elbukna).
+        megfelelő eredménynél nem állunk meg, hanem megkeressük a legnagyobb CRF-et,
+        amely még minden küszöböt teljesít (lásd _next_crf_upward).
 
         Visszatérés: a legjobb jelölt (a kódolt fájl a job.best_path-on), vagy
         None, ha egyik próba sem teljesített minden küszöböt.
@@ -700,13 +806,11 @@ class Transcoder:
 
             if not failed:
                 best = self._keep_if_better(job, best, crf, scores, from_cache)
-                next_crf = self._next_crf_after_pass(tried, crf, settings, best) if best is not None else None
+                next_crf = self._next_crf_upward(tried, settings, best) if best is not None else None
             elif best is not None:
-                # Egy nagyobb CRF már nem teljesít valamit: elértük a határt,
-                # a korábbi legjobb marad a végleges jelölt.
-                labels = ", ".join(METRIC_LABELS[m] for m in failed)
-                self._log(f"  [Határ] CRF {crf} már nem teljesíti: {labels}. A legjobb megfelelő CRF: {best.crf}.")
-                next_crf = None
+                # Már van megfelelő CRF, ez a nagyobb viszont elbukott: a határ a
+                # kettő között van, ott keresünk tovább.
+                next_crf = self._next_crf_upward(tried, settings, best)
             else:
                 next_crf = self._next_crf_after_fail(history, crf, scores, settings, failed)
 
@@ -748,41 +852,78 @@ class Transcoder:
         self._log(f"  [Új legjobb] CRF {crf} -> Átlag: {scores.mean:.2f} (célkülönbség: +{gap:.2f})")
         return Candidate(crf, scores, gap)
 
-    def _next_crf_after_pass(
-        self, tried: dict[int, VmafScores], crf: int, settings: EncodeSettings, best: Candidate
-    ) -> int | None:
-        """Minden küszöb teljesült: próbáljuk a következő CRF-et, ha van esély rá."""
-        if crf >= MAX_CRF:
+    def _next_crf_upward(self, tried: dict[int, VmafScores], settings: EncodeSettings, best: Candidate) -> int | None:
+        """
+        Van már megfelelő CRF: a legnagyobb még megfelelő CRF-et keressük.
+
+        lo = a legnagyobb megfelelt CRF, hi = a legkisebb fölötte elbukott (ha
+        van). A mért pontokból mutatónként megbecsüljük, melyik CRF-nél éri el a
+        küszöböt, és oda ugrunk; egyesével lépkedés helyett így jóval kevesebb
+        próbakódolás kell. Minden próba szűkíti a [lo, hi] sávot, így a keresés
+        biztosan véget ér. None: nincs több értelmes próba.
+        """
+        lo = max(c for c, s in tried.items() if not settings.failed_metrics(s))
+        hi = min((c for c, s in tried.items() if c > lo and settings.failed_metrics(s)), default=None)
+
+        if hi == lo + 1:
+            labels = ", ".join(METRIC_LABELS[m] for m in settings.failed_metrics(tried[hi]))
+            self._log(f"  [Határ] CRF {hi} már nem teljesíti: {labels}. A legjobb megfelelő CRF: {best.crf}.")
+            return None
+        if hi is None and lo >= MAX_CRF:
             self._log("  [Info] Elértük a maximális CRF-et.")
             return None
 
-        next_crf = crf + 1
-
-        # Mielőtt egy teljes kódolást + VMAF-ot rászánnánk: a már megmért CRF-ek
-        # alapján megbecsüljük mindhárom mutatót a következő CRF-nél. Nem csak az
-        # átlag tartalékát nézzük, hanem a legszűkebb küszöböt is (pl. ha az 5% épp
-        # csak 0.01-gyel van felette, és egy nagyobb CRF már elbukott rajta, a +1
-        # próba szinte biztosan felesleges).
+        # Mutatónként: hol éri el a küszöböt (lineáris becslés lo körül)?
+        crossings = []
+        reserves = []
         predicted_fail = []
         for metric, label in METRIC_LABELS.items():
-            threshold = settings.threshold(metric)
-            if threshold is None or getattr(tried[crf], metric) is None:
+            threshold, value = settings.threshold(metric), getattr(tried[lo], metric)
+            if threshold is None or value is None:
                 continue
-            predicted = predict_metric(tried, crf, metric, next_crf)
-            if predicted is not None and predicted < threshold:
-                predicted_fail.append(f"{label} ~{predicted:.2f} < {threshold:.2f}")
+            reserves.append(value - threshold)
+            slope = reference_slope(tried, lo, metric)
+            if slope is None or slope >= 0:
+                continue        # nincs (csökkenő) meredekség, nincs mire alapozni
+            crossings.append(lo + (threshold - value) / slope)
+            if value + slope < threshold:
+                predicted_fail.append(f"{label} ~{value + slope:.2f} < {threshold:.2f}")
 
-        if predicted_fail:
+        # Ha még nincs elbukott CRF fölöttünk, és már a következő is a becslés szerint
+        # elbukna, nem pazarolunk rá kódolást. Ha viszont van mért felső határ, a
+        # köztes értékeket mindig kipróbáljuk: a VMAF (főleg az alsó 1%/5%) nem
+        # lineáris, a két mérés közti becslés gyakran téved.
+        if predicted_fail and hi is None:
             self._log(
-                f"  [Határ] CRF {next_crf} a mért adatok alapján már nem teljesítené: "
+                f"  [Határ] CRF {lo + 1} a mért adatok alapján már nem teljesítené: "
                 f"{', '.join(predicted_fail)}. A legjobb megfelelő CRF: {best.crf}."
             )
             return None
 
-        self._log(
-            f"  [Info] Minden küszöb teljesült. Következő próba: CRF {next_crf}, "
-            "hátha az is megfelel (kisebb fájl)."
-        )
+        if crossings:
+            guess = math.floor(min(crossings))
+        elif hi is not None:
+            guess = (lo + hi) // 2
+        else:
+            # Még nincs meredekség: a legszűkebb tartalékból, óvatos feltételezett eséssel.
+            guess = lo + math.floor(min(reserves, default=0.0) / FALLBACK_LOW_SLOPE)
+
+        if hi is None:
+            next_crf = clamp(guess, lo + 1, min(lo + MAX_UP_JUMP, MAX_CRF))
+            self._log(
+                f"  [Info] Minden küszöb teljesült. Következő próba: CRF {next_crf}, "
+                "hátha az is megfelel (kisebb fájl)."
+            )
+        else:
+            next_crf = clamp(guess, lo + 1, hi - 1)
+            # Ne a sáv széléhez tapadjunk: így a sáv minden lépésben érdemben szűkül.
+            if hi - lo > 3:
+                margin = (hi - lo) // 4
+                next_crf = clamp(next_crf, lo + margin, hi - margin)
+            self._log(
+                f"  [Info] A határ CRF {lo} (megfelel) és CRF {hi} (nem felel meg) között van. "
+                f"Következő próba: CRF {next_crf}."
+            )
         return next_crf
 
     def _next_crf_after_fail(
@@ -830,8 +971,9 @@ class Transcoder:
             "ffmpeg", "-y", "-i", job.input_file,
             *job.map_args,
             "-c:v", "libsvtav1", "-preset", settings.preset, "-crf", str(crf),
-            *job.audio_args,
-            "-c:s", "copy", job.temp_path,
+            *job.video_args,
+            *job.codec_args,
+            job.temp_path,
         ]
         ok, err_log = self._run_ffmpeg(encode_cmd, job.duration, settings.low_priority)
         self._check_cancel()
@@ -950,6 +1092,43 @@ def _kill_quietly(process: subprocess.Popen) -> None:
         process.kill()
 
 
+class OverallProgress:
+    """
+    A teljes lista haladása. A fájlokat a videó hosszával súlyozzuk (a
+    kódolási idő nagyjából ezzel arányos); a teljes hátralévő időt az eddig
+    feldolgozott fájlok tényleges sebességéből becsüljük.
+    """
+
+    def __init__(self, durations: list[float]):
+        known = [d for d in durations if d > 0]
+        fallback = sum(known) / len(known) if known else 1.0      # ismeretlen hosszú fájlhoz
+        self._weights = [d if d > 0 else fallback for d in durations]
+        self._total = sum(self._weights)
+        self._done = 0.0
+        self._elapsed = 0.0
+        self.count = len(durations)
+        self.finished = 0
+
+    def skip(self, index: int) -> None:
+        """A fájl kimarad (törölték / eltűnt): nem számít bele a munkába."""
+        self._total -= self._weights[index]
+
+    def finish(self, index: int, seconds: float) -> None:
+        self._done += self._weights[index]
+        self._elapsed += seconds
+        self.finished += 1
+
+    @property
+    def percent(self) -> float:
+        return 100.0 * self._done / self._total if self._total > 0 else 100.0
+
+    @property
+    def eta(self) -> float | None:
+        if self._done <= 0:
+            return None
+        return self._elapsed / self._done * max(0.0, self._total - self._done)
+
+
 # =============================================================================
 # 8. AV1VmafApp – a Tkinter felület
 # =============================================================================
@@ -964,7 +1143,7 @@ class AV1VmafApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("AV1 VMAF Újratömörítő (Okos Kereséssel + Sávválasztóval)")
-        self.root.geometry("950x790")
+        self.root.geometry("950x850")
 
         # Útvonal -> adat, a lista aktuális sorrendjében.
         self.entries: dict[str, FileEntry] = {}
@@ -1033,6 +1212,11 @@ class AV1VmafApp:
         ttk.Checkbutton(
             frame, text="Alacsony prioritás (Háttérben futás)", variable=self.low_priority_var
         ).grid(row=2, column=2, columnspan=2, sticky=tk.W, pady=5, padx=(15, 0))
+
+        self.ten_bit_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame, text="10 bites kódolás (kisebb fájl azonos minőségnél)", variable=self.ten_bit_var
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=5)
 
     @staticmethod
     def _labeled_entry(parent: ttk.Frame, text: str, row: int, column: int) -> ttk.Entry:
@@ -1120,6 +1304,16 @@ class AV1VmafApp:
         self.eta_label = ttk.Label(info, text=f"Hátralévő idő: {format_time(None)}")
         self.eta_label.pack(side=tk.RIGHT)
 
+        # Összesített folyamat (a teljes lista)
+        self.overall_var = tk.DoubleVar()
+        ttk.Progressbar(frame, variable=self.overall_var, maximum=100).pack(fill=tk.X, pady=(8, 5))
+        overall_info = ttk.Frame(frame)
+        overall_info.pack(fill=tk.X)
+        self.overall_label = ttk.Label(overall_info, text="Összesen: -")
+        self.overall_label.pack(side=tk.LEFT)
+        self.overall_eta_label = ttk.Label(overall_info, text=f"Teljes hátralévő idő: {format_time(None)}")
+        self.overall_eta_label.pack(side=tk.RIGHT)
+
     # --- Beállítások ----------------------------------------------------------
 
     def _config_entries(self) -> tuple[tuple[ttk.Entry, str], ...]:
@@ -1139,6 +1333,7 @@ class AV1VmafApp:
             widget.insert(0, config[key])
         self.preset_combo.set(config["preset"])
         self.low_priority_var.set(config["low_priority"])
+        self.ten_bit_var.set(config["ten_bit"])
         self.sort_crit_combo.set(config["sort_crit"])
         self.sort_order_combo.set(config["sort_order"])
 
@@ -1147,6 +1342,7 @@ class AV1VmafApp:
         config.update(
             preset=self.preset_combo.get(),
             low_priority=self.low_priority_var.get(),
+            ten_bit=self.ten_bit_var.get(),
             sort_crit=self.sort_crit_combo.get(),
             sort_order=self.sort_order_combo.get(),
         )
@@ -1161,6 +1357,7 @@ class AV1VmafApp:
             tolerance=float(self.tol_entry.get()),
             preset=self.preset_combo.get(),
             low_priority=self.low_priority_var.get(),
+            ten_bit=self.ten_bit_var.get(),
         )
 
     # --- Napló és folyamatjelző -------------------------------------------------
@@ -1176,6 +1373,11 @@ class AV1VmafApp:
         self.progress_var.set(progress)
         self.progress_label.config(text=f"{progress:.1f}%")
         self.eta_label.config(text=f"Hátralévő idő: {format_time(eta_seconds)}")
+
+    def update_overall(self, text: str, percent: float, eta_seconds: float | None) -> None:
+        self.overall_var.set(percent)
+        self.overall_label.config(text=f"Összesen: {text} ({percent:.0f}%)")
+        self.overall_eta_label.config(text=f"Teljes hátralévő idő: {format_time(eta_seconds)}")
 
     # --- Fájllista ----------------------------------------------------------
 
@@ -1348,26 +1550,32 @@ class AV1VmafApp:
     def _process_queue(self, paths: list[str], settings: EncodeSettings) -> None:
         """A feldolgozó szál: sorban végigmegy a lista indításkori tartalmán."""
         self.log("--- FELDOLGOZÁS INDÍTVA ---")
+        overall = OverallProgress([self.entries[p].info.duration if p in self.entries else 0.0 for p in paths])
         try:
-            for path in paths:
+            for index, path in enumerate(paths):
                 if self.transcoder.cancelled:
                     break
                 entry = self.entries.get(path)
                 if entry is None:       # időközben törölték a listából
+                    overall.skip(index)
                     continue
 
                 name = os.path.basename(path)
                 if not os.path.exists(path):
                     self.log(f"\n[Kihagyva] A fájl már nem található a lemezen: {name}")
+                    overall.skip(index)
                     self._run_on_ui(self._remove_entry, path)
                     continue
 
+                self._report_overall(overall, f"{index + 1}/{overall.count}. fájl")
                 self.log(f"\n-> Fájl feldolgozása: {name}")
+                started = time.monotonic()
                 success = self.transcoder.process_file(entry, settings)
 
                 if self.transcoder.cancelled:
                     self.log(f"[MEGSZAKÍTVA] A folyamat leállítva: {name}")
                     break
+                overall.finish(index, time.monotonic() - started)
                 if success:
                     self.log(f"[KÉSZ] Fájl feldolgozva: {name}")
                 else:
@@ -1377,7 +1585,11 @@ class AV1VmafApp:
             self.log(f"\n[Kritikus Hiba] Váratlan hiba a feldolgozás közben: {e}")
         finally:
             self.log("\n--- FELDOLGOZÁS VÉGE ---")
+            self._run_on_ui(self.update_overall, f"{overall.finished}/{overall.count} fájl kész", overall.percent, None)
             self._run_on_ui(self._on_processing_finished)
+
+    def _report_overall(self, overall: OverallProgress, text: str) -> None:
+        self._run_on_ui(self.update_overall, text, overall.percent, overall.eta)
 
     def _on_processing_finished(self) -> None:
         self.is_processing = False
