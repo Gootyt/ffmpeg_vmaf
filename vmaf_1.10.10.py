@@ -232,6 +232,7 @@ class MediaInfo:
     resolution: str = "0x0"
     duration: float = 0.0
     bitrate: float = 0.0
+    frame_rate: float = 0.0     # átlagos képkocka/s, 0 ha ismeretlen
     bit_depth: int = 8
     # Színinformációk ffprobe-nevekkel ("" ha ismeretlen); HDR-nél fontos megőrizni.
     color_primaries: str = ""
@@ -341,6 +342,7 @@ class EncodeJob:
     video_args: list[str]       # pixelformátum, színinformációk
     codec_args: list[str]       # hang- és feliratsávonkénti kodekbeállítások
     resolution: str
+    frame_rate: float = 0.0
 
     @property
     def temp_path(self) -> str:
@@ -499,6 +501,13 @@ def _bit_depth(pix_fmt: str) -> int:
     return int(match.group(1)) if match else 8
 
 
+def _fraction(value) -> float:
+    """ffprobe tört ("24000/1001") értéke; 0 ha ismeretlen vagy érvénytelen."""
+    numerator, _, denominator = str(value or "").partition("/")
+    den = to_float(denominator or 1)
+    return to_float(numerator) / den if den > 0 else 0.0
+
+
 def _known(value) -> str:
     """ffprobe színinformáció; az ismeretlen / fenntartott értékből üres szöveg."""
     value = str(value or "")
@@ -535,6 +544,7 @@ def probe_media(path: str) -> MediaInfo | None:
         info.video_codec = str(video.get("codec_name", "")).lower()
         info.resolution = f"{video.get('width', 0)}x{video.get('height', 0)}"
         info.bit_depth = _bit_depth(str(video.get("pix_fmt", "")))
+        info.frame_rate = _fraction(video.get("avg_frame_rate"))
         info.color_primaries = _known(video.get("color_primaries"))
         info.color_transfer = _known(video.get("color_transfer"))
         info.color_space = _known(video.get("color_space"))
@@ -683,7 +693,10 @@ class Transcoder:
         duration = entry.info.duration if entry.info.duration > 0 else probe_duration(entry.path)
         map_args, codec_args = self._build_stream_args(entry)
         video_args = self._build_video_args(entry.info, settings)
-        job = EncodeJob(entry.path, settings, duration, map_args, video_args, codec_args, entry.info.resolution)
+        job = EncodeJob(
+            entry.path, settings, duration, map_args, video_args, codec_args,
+            entry.info.resolution, entry.info.frame_rate,
+        )
 
         safe_remove(job.best_path)      # egy korábbi, megszakított futás maradéka
         try:
@@ -982,9 +995,20 @@ class Transcoder:
 
         self._log("  Kódolás kész. VMAF számolása a teljes videón...")
         threads = max(1, (os.cpu_count() or 4) - 1)
+        # A libvmaf időbélyeg alapján párosítja a képkockákat, de az MKV ezredmásodpercre
+        # kerekít (pl. MP4-ben 0,041667 s, a kódoltban 0,042 s), így egyes képkockák a
+        # szomszédjukkal hasonlítódnának össze és a VMAF hamisan alacsony lenne. Ezért
+        # mindkét oldalt a képkocka sorszámából számolt, azonos időbélyeggel látjuk el
+        # (a képkockasebesség csak a folyamatjelző "time=" értékéhez kell).
+        fps = job.frame_rate if job.frame_rate > 0 else 25.0
+        sync = f"settb=AVTB,setpts=N/{fps:.6f}/TB"
+        vmaf_filter = (
+            f"[0:v]{sync}[dis];[1:v]{sync}[ref];"
+            f"[dis][ref]libvmaf=log_fmt=json:log_path={VMAF_LOG_FILE}:n_threads={threads}:n_subsample=5"
+        )
         vmaf_cmd = [
             "ffmpeg", "-y", "-i", job.temp_path, "-i", job.input_file,
-            "-lavfi", f"libvmaf=log_fmt=json:log_path={VMAF_LOG_FILE}:n_threads={threads}:n_subsample=5",
+            "-lavfi", vmaf_filter,
             "-f", "null", "-",
         ]
         ok, err_log = self._run_ffmpeg(vmaf_cmd, job.duration, settings.low_priority)
