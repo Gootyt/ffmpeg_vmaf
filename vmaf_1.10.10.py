@@ -47,6 +47,7 @@ from typing import NamedTuple
 CONFIG_FILE = "av1_vmaf_config.json"
 SKIPPED_DB_FILE = "av1_skipped_db.json"
 HISTORY_DB_FILE = "av1_history_db.json"
+RESULT_CACHE_FILE = "av1_result_cache.json"
 # Szándékosan relatív útvonal: a libvmaf szűrő paraméterlistájában a ":"
 # elválasztó, így egy meghajtóbetűs Windows-útvonal elrontaná a szűrőt.
 VMAF_LOG_FILE = "temp_vmaf_log.json"
@@ -60,6 +61,18 @@ HISTORY_LIMIT = 500             # ennyi korábbi mérést őrzünk meg a kezdő 
 DEFAULT_START_CRF = 30
 START_CRF_MIN, START_CRF_MAX = 15, 45
 START_CRF_NEIGHBOURS = 5        # a célhoz legközelebbi ennyi korábbi mérés CRF-átlaga
+
+# Komplexitás (SI/TI, ITU-T P.910) – a teljes videó minden képkockáján mérve
+SITI_ANALYSIS_WIDTH = 960       # közös elemzési szélesség: gyorsít, és összevethetővé teszi a felbontásokat
+SITI_MIN_SEGMENT_SECONDS = 60   # ennél rövidebb szakaszokra nem bontunk (párhuzamos mérés)
+SITI_MAX_PARALLEL = 8
+SITI_OUTPUT_TAIL_LINES = 60     # az összegzés a kimenet végén van
+SIMILAR_COMPLEXITY_MAX = 0.35   # log-távolság (SI és TI), amelyen belül két videó "hasonló"
+SIMILAR_VIDEOS_MIN = 2          # ennyi hasonló videó kell, különben a régi becslés marad
+SIMILAR_VIDEOS_MAX = 3
+
+RESULT_CACHE_VERSION = 1        # emelni kell, ha a mérés módja változik (a régi cache érvénytelen)
+RESULT_CACHE_LIMIT = 300        # ennyi fájl adatát őrizzük meg (a legrégebben használtak törlődnek)
 
 MIN_CRF, MAX_CRF = 1, 46
 MAX_ITERATIONS = 20
@@ -99,6 +112,11 @@ DEFAULT_CONFIG = {
 METRIC_LABELS = {"mean": "átlag", "low_5": "5%", "low_1": "1%"}
 
 FFMPEG_TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+SITI_SUMMARY_RE = re.compile(
+    r"Total frames:\s*(\d+)\s*Spatial Information:\s*Average:\s*([\d.]+).*?"
+    r"Temporal Information:\s*Average:\s*([\d.]+)",
+    re.S,
+)
 
 
 # =============================================================================
@@ -324,12 +342,23 @@ class EncodeSettings:
         return threshold - value
 
 
+class Complexity(NamedTuple):
+    """A videó térbeli (SI) és időbeli (TI) részletessége, a képkockák átlaga."""
+    si: float
+    ti: float
+
+    def distance(self, other: Complexity) -> float:
+        """Skálafüggetlen (logaritmikus) távolság; 0.35 kb. ±40% eltérés az egyikben."""
+        return abs(math.log((self.si + 1) / (other.si + 1))) + abs(math.log((self.ti + 1) / (other.ti + 1)))
+
+
 @dataclass(frozen=True)
 class Candidate:
     """Az eddigi legjobb, minden küszöböt teljesítő próbakódolás."""
     crf: int
     scores: VmafScores
     gap: float                  # átlag VMAF - cél (>= 0)
+    has_file: bool = True       # False: korábbi futásból ismert eredmény, a fájlt még el kell készíteni
 
 
 @dataclass(frozen=True)
@@ -343,6 +372,13 @@ class EncodeJob:
     codec_args: list[str]       # hang- és feliratsávonkénti kodekbeállítások
     resolution: str
     frame_rate: float = 0.0
+    complexity: Complexity | None = None
+
+    @property
+    def cache_key(self) -> str:
+        """A mérési eredményt befolyásoló beállítások (a gyorsítótár kulcsa)."""
+        bits = 10 if "yuv420p10le" in self.video_args else 8
+        return f"preset={self.settings.preset};bits={bits}"
 
     @property
     def temp_path(self) -> str:
@@ -405,26 +441,128 @@ class EncodeHistory:
         data = load_json(path, [])
         self._records: list[dict] = [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
 
-    def add(self, vmaf: float, crf: int, preset: str, resolution: str) -> None:
-        self._records.append({"vmaf": vmaf, "crf": crf, "preset": preset, "resolution": resolution})
+    def add(
+        self, vmaf: float, crf: int, preset: str, resolution: str, complexity: Complexity | None = None
+    ) -> None:
+        record = {"vmaf": vmaf, "crf": crf, "preset": preset, "resolution": resolution}
+        if complexity is not None:
+            record.update(si=complexity.si, ti=complexity.ti)
+        self._records.append(record)
         self._records = self._records[-self._limit:]
         save_json(self._path, self._records)
 
-    def estimate_starting_crf(self, target_vmaf: float, preset: str, resolution: str) -> int:
+    def estimate_starting_crf(
+        self, target_vmaf: float, preset: str, resolution: str, complexity: Complexity | None = None
+    ) -> tuple[int, int]:
         """
         A célhoz legközelebbi korábbi mérések CRF-átlaga. Ha van ilyen, az azonos
         presetű, azon belül az azonos felbontású méréseket részesíti előnyben.
+
+        Ha ismert a videó komplexitása, és van legalább SIMILAR_VIDEOS_MIN hasonló
+        komplexitású korábbi videó, csak azok méréseiből becsül. Visszatérés:
+        (kezdő CRF, a felhasznált hasonló videók száma; 0 = régi módszer).
         """
         if not self._records:
-            return DEFAULT_START_CRF
+            return DEFAULT_START_CRF, 0
 
         candidates = [r for r in self._records if r.get("preset") == preset] or self._records
+        similar_count = 0
+        if complexity is not None:
+            similar = self._similar_records(candidates, complexity)
+            if similar:
+                candidates, similar_count = similar
         candidates = [r for r in candidates if r.get("resolution") == resolution] or candidates
 
         closest = sorted(candidates, key=lambda r: abs(r.get("vmaf", 93.0) - target_vmaf))
         closest = closest[:START_CRF_NEIGHBOURS]
         avg_crf = sum(r.get("crf", DEFAULT_START_CRF) for r in closest) / len(closest)
-        return clamp(round(avg_crf), START_CRF_MIN, START_CRF_MAX)
+        return clamp(round(avg_crf), START_CRF_MIN, START_CRF_MAX), similar_count
+
+    @staticmethod
+    def _similar_records(records: list[dict], complexity: Complexity) -> tuple[list[dict], int] | None:
+        """A komplexitásban legközelebbi (legfeljebb SIMILAR_VIDEOS_MAX) videó mérései."""
+        # Egy videó összes mérése ugyanazt az SI/TI párt hordozza: így csoportosítunk videónként.
+        by_video: dict[Complexity, list[dict]] = {}
+        for r in records:
+            si, ti = r.get("si"), r.get("ti")
+            if isinstance(si, (int, float)) and isinstance(ti, (int, float)):
+                by_video.setdefault(Complexity(si, ti), []).append(r)
+
+        ranked = sorted(by_video, key=complexity.distance)
+        nearest = [c for c in ranked if complexity.distance(c) <= SIMILAR_COMPLEXITY_MAX][:SIMILAR_VIDEOS_MAX]
+        if len(nearest) < SIMILAR_VIDEOS_MIN:
+            return None
+        return [r for c in nearest for r in by_video[c]], len(nearest)
+
+
+class ResultCache:
+    """
+    Fájlonkénti gyorsítótár: a videó komplexitása (SI/TI) és a már megmért CRF-ek
+    VMAF-eredménye. Leállítás vagy összeomlás után így a következő futás nem
+    kezdi elölről: a megmért CRF-eket nem kódolja újra, a SI/TI-t nem méri újra.
+
+    Egy bejegyzés csak addig érvényes, amíg a fájl mérete és módosítási ideje
+    nem változik. path=None: csak memóriában (nem ment).
+    """
+
+    def __init__(self, path: str | None = RESULT_CACHE_FILE, limit: int = RESULT_CACHE_LIMIT):
+        self._path = path
+        self._limit = limit
+        data = load_json(path, {}) if path else {}
+        valid = isinstance(data, dict) and data.get("version") == RESULT_CACHE_VERSION
+        files = data.get("files") if valid else None
+        self._files: dict[str, dict] = files if isinstance(files, dict) else {}
+
+    def complexity(self, filepath: str) -> Complexity | None:
+        value = (self._entry(filepath) or {}).get("complexity")
+        return Complexity(*value) if isinstance(value, list) and len(value) == 2 else None
+
+    def set_complexity(self, filepath: str, complexity: Complexity) -> None:
+        entry = self._entry(filepath, create=True)
+        if entry is not None:
+            entry["complexity"] = list(complexity)
+            self._save()
+
+    def trials(self, filepath: str, key: str) -> dict[int, VmafScores]:
+        stored = (self._entry(filepath) or {}).get("trials", {}).get(key, {})
+        result = {}
+        for crf, values in stored.items():
+            with contextlib.suppress(TypeError, ValueError):
+                result[int(crf)] = VmafScores(*values)
+        return result
+
+    def add_trial(self, filepath: str, key: str, crf: int, scores: VmafScores) -> None:
+        entry = self._entry(filepath, create=True)
+        if entry is not None:
+            entry.setdefault("trials", {}).setdefault(key, {})[str(crf)] = list(scores)
+            self._save()
+
+    def forget(self, filepath: str) -> None:
+        if self._files.pop(filepath, None) is not None:
+            self._save()
+
+    def _entry(self, filepath: str, create: bool = False) -> dict | None:
+        """A fájl bejegyzése, ha még érvényes (azonos méret és módosítási idő)."""
+        try:
+            identity = {"size": os.path.getsize(filepath), "mtime": os.path.getmtime(filepath)}
+        except OSError:
+            return None
+        entry = self._files.get(filepath)
+        if entry is not None and any(entry.get(k) != v for k, v in identity.items()):
+            entry = None            # a fájl megváltozott: a régi adatok nem érvényesek
+        if entry is None:
+            if not create:
+                return None
+            entry = self._files[filepath] = dict(identity)
+        entry["used"] = time.time()
+        return entry
+
+    def _save(self) -> None:
+        if len(self._files) > self._limit:
+            newest = sorted(self._files, key=lambda f: self._files[f].get("used", 0), reverse=True)
+            self._files = {f: self._files[f] for f in newest[: self._limit]}
+        if self._path:
+            save_json(self._path, {"version": RESULT_CACHE_VERSION, "files": self._files})
 
 
 # =============================================================================
@@ -570,6 +708,24 @@ def parse_ffmpeg_time(line: str) -> float | None:
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
+def parse_siti_summaries(outputs: list[str]) -> Complexity | None:
+    """
+    Az ffmpeg siti szűrő összegzéseinek (szakaszonként egy) képkockaszámmal
+    súlyozott átlaga. Az ffmpeg néha egy üres ("Total frames: 0") összegzést is
+    kiír; azt kihagyjuk. None, ha egyik kimenetben sincs érvényes összegzés.
+    """
+    frames = si_sum = ti_sum = 0.0
+    for output in outputs:
+        for count, si, ti in SITI_SUMMARY_RE.findall(output):
+            n = int(count)
+            frames += n
+            si_sum += n * float(si)
+            ti_sum += n * float(ti)
+    if frames <= 0:
+        return None
+    return Complexity(round(si_sum / frames, 2), round(ti_sum / frames, 2))
+
+
 def _low_percentile(sorted_scores: list[float], fraction: float) -> float:
     return sorted_scores[max(0, int(len(sorted_scores) * fraction) - 1)]
 
@@ -655,13 +811,15 @@ class Transcoder:
         skipped: SkippedFiles,
         log: Callable[[str], None],
         on_progress: Callable[[float, float | None], None],
+        cache: ResultCache | None = None,
     ):
         self._history = history
         self._skipped = skipped
         self._log = log
         self._on_progress = on_progress
+        self._cache = cache if cache is not None else ResultCache(path=None)
         self._cancel_event = threading.Event()
-        self._process: subprocess.Popen | None = None
+        self._processes: list[subprocess.Popen] = []
 
     # --- Leállítás --------------------------------------------------------
 
@@ -673,10 +831,9 @@ class Transcoder:
         self._cancel_event.clear()
 
     def cancel(self) -> None:
-        """Leállítást kér, és azonnal kilövi a futó ffmpeg folyamatot."""
+        """Leállítást kér, és azonnal kilövi a futó ffmpeg folyamato(ka)t."""
         self._cancel_event.set()
-        process = self._process
-        if process is not None:
+        for process in list(self._processes):
             _kill_quietly(process)
 
     def _check_cancel(self) -> None:
@@ -700,10 +857,18 @@ class Transcoder:
 
         safe_remove(job.best_path)      # egy korábbi, megszakított futás maradéka
         try:
+            job = replace(job, complexity=self._get_complexity(job))
             best = self._search_best_crf(job)
             if best is None:
                 self._log("  [Hiba] Nem sikerült olyan CRF-et találni, amely minden VMAF minimumcélt teljesíti.")
                 return False
+            if not best.has_file:
+                self._log(
+                    f"  > A legjobb CRF ({best.crf}) eredménye korábbi futásból ismert: "
+                    "végleges kódolás (VMAF-mérés nélkül)..."
+                )
+                self._encode(job, best.crf)
+                os.replace(job.temp_path, job.best_path)
             return self._finalize(job, best)
         except _Cancelled:
             return False
@@ -787,15 +952,32 @@ class Transcoder:
         None, ha egyik próba sem teljesített minden küszöböt.
         """
         settings = job.settings
-        crf = self._history.estimate_starting_crf(settings.target_vmaf, settings.preset, job.resolution)
-        self._log(f"  [Info] Becsült kezdő CRF a korábbi kódolások alapján: {crf}")
+        crf, similar = self._history.estimate_starting_crf(
+            settings.target_vmaf, settings.preset, job.resolution, job.complexity
+        )
+        if similar:
+            self._log(f"  [Info] Becsült kezdő CRF {similar} hasonló komplexitású korábbi videó alapján: {crf}")
+        else:
+            self._log(f"  [Info] Becsült kezdő CRF a korábbi kódolások alapján: {crf}")
 
-        # crf -> mért eredmény. Egy már megmért CRF-et nem kódolunk újra
-        # (pl. amikor a keresés visszaérkezik egy korábban elutasított CRF-hez).
-        tried: dict[int, VmafScores] = {}
+        # crf -> mért eredmény. Egy már megmért CRF-et nem kódolunk újra (pl. amikor
+        # a keresés visszaérkezik egy korábban elutasított CRF-hez). Egy korábbi,
+        # megszakított futás méréseit a gyorsítótárból töltjük be.
+        tried: dict[int, VmafScores] = self._cache.trials(job.input_file, job.cache_key)
+        cached_before = set(tried)
         # Időrendi mérési sor (a gyorsítótárból újrafelhasználtakkal együtt) a lépésközökhöz.
         history: list[tuple[int, VmafScores]] = []
         best: Candidate | None = None
+        if cached_before:
+            self._log(
+                "  [Info] Korábbi futásból ismert CRF-ek (nem kódoljuk újra): "
+                + ", ".join(str(c) for c in sorted(cached_before))
+            )
+            # A felfelé keresés az összes ismert mérést használja, ezért a legjobb
+            # jelöltnek is az összes ismert megfelelő eredmény közül kell kikerülnie.
+            for known_crf in sorted(tried):
+                if not settings.failed_metrics(tried[known_crf]):
+                    best = self._keep_if_better(job, best, known_crf, tried[known_crf], from_cache=True)
 
         for iteration in range(1, MAX_ITERATIONS + 1):
             self._check_cancel()
@@ -803,15 +985,22 @@ class Transcoder:
             from_cache = crf in tried
             if from_cache:
                 scores = tried[crf]
-                self._log(
-                    f"  [Iteráció {iteration}] CRF {crf} már szerepel a korábbi "
-                    "próbák között -> újrafelhasznált eredmény, nincs újrakódolás."
-                )
+                if crf in cached_before:
+                    self._log(
+                        f"  [Iteráció {iteration}] CRF {crf} eredménye korábbi futásból ismert "
+                        "-> nincs újrakódolás."
+                    )
+                else:
+                    self._log(
+                        f"  [Iteráció {iteration}] CRF {crf} már szerepel a korábbi "
+                        "próbák között -> újrafelhasznált eredmény, nincs újrakódolás."
+                    )
             else:
                 self._log(f"  [Iteráció {iteration}] Próba kódolás CRF {crf} értékkel (várj türelemmel)...")
                 scores = self._measure(job, crf)
                 tried[crf] = scores
-                self._history.add(scores.mean, crf, settings.preset, job.resolution)
+                self._cache.add_trial(job.input_file, job.cache_key, crf, scores)
+                self._history.add(scores.mean, crf, settings.preset, job.resolution, job.complexity)
 
             self._log(format_scores(crf, scores))
             history.append((crf, scores))
@@ -849,17 +1038,18 @@ class Transcoder:
         )
 
         if not is_better:
-            safe_remove(job.temp_path)
+            if not from_cache:
+                safe_remove(job.temp_path)
             return best
 
         if from_cache:
-            # A gyakorlatban nem fordulhat elő: a keresés soha nem lép vissza egy
-            # már sikeresnek bizonyult CRF-hez. Fájl nélkül nem írjuk felül a legjobbat.
+            # Korábbi futásból ismert eredmény: a kódolt fájl nincs meg, ha ez marad
+            # a legjobb, a keresés végén egyszer elkészítjük (VMAF-mérés nélkül).
             self._log(
-                f"  [Figyelem] CRF {crf} gyorsítótárazott eredménye jobb lenne, "
-                "de a kódolt fájl már nem érhető el újrafelhasználásra."
+                f"  [Új legjobb] CRF {crf} -> Átlag: {scores.mean:.2f} (célkülönbség: +{gap:.2f}, "
+                "korábbi mérésből)"
             )
-            return best
+            return Candidate(crf, scores, gap, has_file=False)
 
         os.replace(job.temp_path, job.best_path)
         self._log(f"  [Új legjobb] CRF {crf} -> Átlag: {scores.mean:.2f} (célkülönbség: +{gap:.2f})")
@@ -977,8 +1167,8 @@ class Transcoder:
 
     # --- Mérés és véglegesítés ---------------------------------------------
 
-    def _measure(self, job: EncodeJob, crf: int) -> VmafScores:
-        """Próbakódolás a megadott CRF-fel, majd VMAF-mérés az eredetihez képest."""
+    def _encode(self, job: EncodeJob, crf: int) -> None:
+        """Kódolás a megadott CRF-fel a job.temp_path-ra."""
         settings = job.settings
         encode_cmd = [
             "ffmpeg", "-y", "-i", job.input_file,
@@ -993,6 +1183,10 @@ class Transcoder:
         if not ok or not os.path.exists(job.temp_path):
             raise TranscodeError("A kódolás sikertelen volt.", err_log)
 
+    def _measure(self, job: EncodeJob, crf: int) -> VmafScores:
+        """Próbakódolás a megadott CRF-fel, majd VMAF-mérés az eredetihez képest."""
+        settings = job.settings
+        self._encode(job, crf)
         self._log("  Kódolás kész. VMAF számolása a teljes videón...")
         threads = max(1, (os.cpu_count() or 4) - 1)
         # A libvmaf időbélyeg alapján párosítja a képkockákat, de az MKV ezredmásodpercre
@@ -1055,60 +1249,144 @@ class Transcoder:
             "Eredeti fájl cseréje a tömörítettre..."
         )
         replace_original(job.input_file, job.best_path)
+        self._cache.forget(job.input_file)
         return True
+
+    # --- Komplexitás (SI/TI) -----------------------------------------------
+
+    def _get_complexity(self, job: EncodeJob) -> Complexity | None:
+        """A videó SI/TI értéke: a gyorsítótárból, vagy a teljes videón mérve."""
+        cached = self._cache.complexity(job.input_file)
+        if cached is not None:
+            self._log(f"  > Komplexitás (korábbi mérésből): SI {cached.si:.1f}, TI {cached.ti:.1f}")
+            return cached
+
+        cmds, durations = self._siti_commands(job.input_file, job.duration)
+        parallel = f", {len(cmds)} párhuzamos szakaszban" if len(cmds) > 1 else ""
+        self._log(f"  [Info] Komplexitás mérése (SI/TI) a teljes videón{parallel}...")
+        results = self._run_ffmpeg_many(cmds, durations, job.settings.low_priority, SITI_OUTPUT_TAIL_LINES)
+        self._check_cancel()
+
+        complexity = parse_siti_summaries([out for _, out in results]) if all(ok for ok, _ in results) else None
+        if complexity is None:
+            self._log("  [Figyelem] A komplexitás mérése nem sikerült; a kezdő CRF becslése enélkül történik.")
+            return None
+        self._cache.set_complexity(job.input_file, complexity)
+        self._log(f"  > Komplexitás: SI {complexity.si:.1f}, TI {complexity.ti:.1f}")
+        return complexity
+
+    @staticmethod
+    def _siti_commands(input_file: str, duration: float) -> tuple[list[list[str]], list[float]]:
+        """
+        A siti szűrő egyszálú és lassú, ezért hosszabb videót időben egyenlő
+        szakaszokra bontunk, és párhuzamosan mérünk; az eredményt a képkockaszámmal
+        súlyozva összesítjük. Minden képkocka mérésre kerül (a szakaszhatárokon
+        a TI egy-egy képkockánál 0, ez elhanyagolható).
+        """
+        workers = max(1, min(SITI_MAX_PARALLEL, (os.cpu_count() or 2) - 1))
+        segments = max(1, min(workers, int(duration // SITI_MIN_SEGMENT_SECONDS))) if duration > 0 else 1
+        length = duration / segments if duration > 0 else 0.0
+        video_filter = f"scale={SITI_ANALYSIS_WIDTH}:-2,format=yuv420p,siti=print_summary=1"
+
+        cmds, durations = [], []
+        for i in range(segments):
+            cmd = ["ffmpeg", "-hide_banner", "-nostdin"]
+            if i > 0:
+                cmd += ["-ss", f"{i * length:.3f}"]
+            if i < segments - 1:
+                cmd += ["-t", f"{length:.3f}"]
+            cmd += ["-i", input_file, "-map", "0:v:0", "-vf", video_filter, "-f", "null", "-"]
+            cmds.append(cmd)
+            durations.append(length if segments > 1 else duration)
+        return cmds, durations
 
     # --- ffmpeg futtatása --------------------------------------------------
 
     def _run_ffmpeg(self, cmd: list[str], total_duration: float, low_priority: bool) -> tuple[bool, str]:
-        """
-        Lefuttat egy ffmpeg parancsot; a "time=" sorokból folyamatjelzést és
-        hátralévő időt számol. Visszatérés: (siker, hibánál a kimenet vége).
-        """
-        if low_priority and not IS_WINDOWS:
-            cmd = ["nice", "-n", "10", *cmd]
+        """Egy ffmpeg parancs futtatása; lásd _run_ffmpeg_many."""
+        return self._run_ffmpeg_many([cmd], [total_duration], low_priority)[0]
 
+    def _run_ffmpeg_many(
+        self,
+        cmds: list[list[str]],
+        durations: list[float],
+        low_priority: bool,
+        tail_lines: int = OUTPUT_TAIL_LINES,
+    ) -> list[tuple[bool, str]]:
+        """
+        ffmpeg parancsok párhuzamos futtatása. A "time=" sorokból közös
+        folyamatjelzést és hátralévő időt számol (a feldolgozott idő összege a
+        teljes időhöz képest). Parancsonként: (siker, a kimenet utolsó sorai).
+        """
+        processes: list[subprocess.Popen] = []
         try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **subprocess_kwargs(low_priority),
-            )
+            for cmd in cmds:
+                if low_priority and not IS_WINDOWS:
+                    cmd = ["nice", "-n", "10", *cmd]
+                processes.append(subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    **subprocess_kwargs(low_priority),
+                ))
         except OSError as e:
-            return False, str(e)
+            for process in processes:
+                _kill_quietly(process)
+                process.wait()
+            return [(False, str(e))] * len(cmds)
 
-        self._process = process
-        output_tail: collections.deque[str] = collections.deque(maxlen=OUTPUT_TAIL_LINES)
+        self._processes = processes
+        tails = [collections.deque(maxlen=tail_lines) for _ in cmds]
+        read_errors: list[str | None] = [None] * len(cmds)
+        positions = [0.0] * len(cmds)
+        total_duration = sum(d for d in durations if d > 0)
         start_time = time.monotonic()
-        try:
-            for line in process.stdout:
-                output_tail.append(line.strip())
-                if self.cancelled:
-                    _kill_quietly(process)
-                    break
+        lock = threading.Lock()
 
-                position = parse_ffmpeg_time(line)
-                if position is not None and total_duration > 0:
-                    progress = min(position / total_duration * 100, 100.0)
-                    elapsed = time.monotonic() - start_time
-                    eta = elapsed / progress * 100 - elapsed if progress > 0.5 else None
-                    self._on_progress(progress, eta)
-            process.wait()
-        except (OSError, ValueError) as e:
-            _kill_quietly(process)
-            return False, str(e)
+        def pump(i: int) -> None:
+            try:
+                for line in processes[i].stdout:
+                    tails[i].append(line.strip())
+                    if self.cancelled:
+                        _kill_quietly(processes[i])
+                        break
+                    position = parse_ffmpeg_time(line)
+                    if position is None or total_duration <= 0:
+                        continue
+                    with lock:
+                        positions[i] = min(position, durations[i]) if durations[i] > 0 else position
+                        progress = min(sum(positions) / total_duration * 100, 100.0)
+                        elapsed = time.monotonic() - start_time
+                        eta = elapsed / progress * 100 - elapsed if progress > 0.5 else None
+                        self._on_progress(progress, eta)
+            except (OSError, ValueError) as e:
+                read_errors[i] = str(e)
+                _kill_quietly(processes[i])
+
+        try:
+            readers = [threading.Thread(target=pump, args=(i,), daemon=True) for i in range(len(cmds))]
+            for reader in readers:
+                reader.start()
+            for reader in readers:
+                reader.join()
+            for process in processes:
+                process.wait()
         finally:
-            self._process = None
+            self._processes = []
             self._on_progress(0.0, None)
 
-        if self.cancelled:
-            return False, "Felhasználó által megszakítva"
-        if process.returncode != 0:
-            return False, "\n".join(output_tail)
-        return True, ""
+        results = []
+        for i, process in enumerate(processes):
+            if self.cancelled:
+                results.append((False, "Felhasználó által megszakítva"))
+            elif read_errors[i] is not None:
+                results.append((False, read_errors[i]))
+            else:
+                results.append((process.returncode == 0, "\n".join(tails[i])))
+        return results
 
 
 def _kill_quietly(process: subprocess.Popen) -> None:
@@ -1176,7 +1454,9 @@ class AV1VmafApp:
         self._ui_queue: queue.Queue = queue.Queue()
 
         self.skipped = SkippedFiles()
-        self.transcoder = Transcoder(EncodeHistory(), self.skipped, log=self.log, on_progress=self._report_progress)
+        self.transcoder = Transcoder(
+            EncodeHistory(), self.skipped, log=self.log, on_progress=self._report_progress, cache=ResultCache()
+        )
 
         self._build_ui()
         self.load_config()
